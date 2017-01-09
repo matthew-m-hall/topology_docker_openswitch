@@ -28,7 +28,7 @@ from re import match, search
 from pexpect import EOF
 
 from topology.platforms.shell import PExpectBashShell
-from topology_docker.shell import DockerShell
+from topology_docker.shell import DockerShell, DockerBashShell
 
 
 _VTYSH_PROMPT_TPL = r'(\r\n)?{}(\([-\w\s]+\))?# '
@@ -41,6 +41,86 @@ VTYSH_FORCED_PROMPT = _VTYSH_PROMPT_TPL.format(_VTYSH_FORCED)
 VTYSH_STANDARD_PROMPT = _VTYSH_PROMPT_TPL.format(_VTYSH_STANDARD)
 
 BASH_FORCED_PROMPT = PExpectBashShell.FORCED_PROMPT
+# if the bash shell is reached through the vtysh cmd 'start-shell', this
+# regular expression will match the defalut prompt
+BASH_START_SHELL_PROMPT = r'(\r\n)?[\w\W]+\$ '
+
+
+class OpenSwitchBashShell(DockerBashShell):
+    """
+    Openswitch Telnet-connected vsctl shell.
+    """
+
+    def __init__(self):
+        super(OpenSwitchBashShell, self).__init__(
+            initial_prompt='(^|\n).*[#$] '
+        )
+
+    def _exit(self):
+        """
+        Attempt a clean exit from the shell.
+        """
+        try:
+            self.send_command('exit', matches=[EOF])
+        except Exception as error:
+            warning(
+                'Exiting the shell failed with this error: {}'.format(
+                    str(error)
+                )
+            )
+
+
+class OpenSwitchVsctlShell(DockerBashShell):
+    """
+    Openswitch Telnet-connected vsctl shell.
+    """
+
+    def __init__(self):
+        super(OpenSwitchVsctlShell, self).__init__(
+            initial_prompt='(^|\n).*[#$] ',
+            prefix='ovs-vsctl ', timeout=60
+        )
+
+
+class OpenSwitchBashSwnsShell(DockerBashShell):
+    """
+    Openswitch Telnet-connected ``bash`` ``swns`` shell.
+
+    This shell spawns a ``bash`` shell inside the ``swns`` network namespace.
+    """
+
+    def __init__(self):
+        super(OpenSwitchBashSwnsShell, self).__init__(
+            initial_prompt='(^|\n).*[#$] '
+        )
+
+    def enter(self):
+        """
+        see :meth:`topology.platforms.shell.BaseShell.enter` for more
+        information.
+        """
+        spawn = self._parent_connection._spawn
+        spawn.sendline('ip netns exec swns bash')
+        spawn.expect(self._prompt)
+
+    def exit(self):
+        """
+        see :meth:`topology.platforms.shell.BaseShell.exit` for more
+        information.
+        """
+        spawn = self._parent_connection._spawn
+        spawn.sendline('exit')
+        spawn.expect(self._prompt)
+
+    def _setup_shell(self):
+        """
+        See :meth:`topology.platforms.shell.BaseShell._setup_shell` for more
+        information.
+        """
+
+        super(OpenSwitchBashSwnsShell, self)._setup_shell()
+
+        self.enter()
 
 
 class OpenSwitchVtyshShell(DockerShell):
@@ -88,11 +168,9 @@ class OpenSwitchVtyshShell(DockerShell):
     Once the container is to be destroyed in the normal clean up of nodes, the
     ``vtysh`` shell is exited to the ``bash`` one by sending the ``end``
     command followed by the ``exit`` command.
-
-    :param str container: identifier of the container that holds this shell
     """
 
-    def __init__(self, container):
+    def __init__(self):
         # The parameter try_filter_echo is disabled by default here to handle
         # images that support the vtysh "set prompt" command and will have its
         # echo disabled since it extends from DockeBashShell. For other
@@ -101,8 +179,37 @@ class OpenSwitchVtyshShell(DockerShell):
         # The prompt value passed here is the one that will match with an
         # OpenSwitch bash shell initial prompt.
         super(OpenSwitchVtyshShell, self).__init__(
-            container, 'bash', '(^|\n).*[#$] ', try_filter_echo=False
+            '(^|\n).*[#$] ', try_filter_echo=False
         )
+
+    def enter(self):
+        """
+        see :meth:`topology.platforms.shell.BaseShell.enter` for more
+        information.
+        """
+        self._handle_prompt()
+
+    def exit(self):
+        """
+        Exit this shell and go into a bash shell.
+
+        see :meth:`topology.platforms.shell.BaseShell.exit` for more
+        information.
+        """
+
+        spawn = self._parent_connection._spawn
+
+        spawn.sendline('end')
+        # This is done to handle calls to hostname that change this prompt.
+        spawn.expect([self._prompt, '^.*# '])
+
+        spawn.sendline('exit')
+        spawn.expect(BASH_FORCED_PROMPT)
+
+        # This is done because vtysh shells for older images enable the bash
+        # shell echo.
+        spawn.sendline('stty -echo')
+        spawn.expect(BASH_FORCED_PROMPT)
 
     def _setup_shell(self, connection=None):
         """
@@ -114,18 +221,25 @@ class OpenSwitchVtyshShell(DockerShell):
         See :meth:`PExpectShell._setup_shell` for more information.
         """
 
-        spawn = self._get_connection(connection)
-        # Since user, password or initial_command are not being used, this is
-        # the first expect done in the connection. The value of self._prompt at
-        # this moment is the initial prompt of an OpenSwitch bash shell prompt.
-        spawn.expect(self._prompt)
+        spawn = self._parent_connection._spawn
 
         # The bash prompt is set to a forced value for vtysh shells that
         # support prompt setting and for the ones that do not.
         spawn.sendline('export PS1={}'.format(BASH_FORCED_PROMPT))
         spawn.expect(BASH_FORCED_PROMPT)
 
-        def determine_set_prompt():
+        self.enter()
+
+    def _handle_prompt(self):
+        """
+        Set the correct vtysh prompt.
+
+        Older and newer OpenSwitch images use different vtysh prompts, this
+        sets the rigth ones depending on the image.
+        """
+        spawn = self._parent_connection._spawn
+
+        def determine_set_prompt(spawn):
             """
             This method determines if the vtysh command set prompt exists.
 
@@ -168,22 +282,7 @@ class OpenSwitchVtyshShell(DockerShell):
         def join_prompt(prompt):
             return '{}|{}'.format(BASH_FORCED_PROMPT, prompt)
 
-        if determine_set_prompt():
-            # If this image supports "set prompt", then exit back to bash to
-            # set the bash shell without echo.
-            spawn.sendline('exit')
-            spawn.expect(BASH_FORCED_PROMPT)
-
-            # This disables the echo in the bash and in the subsequent vtysh
-            # shell too.
-            spawn.sendline('stty -echo')
-            spawn.expect(BASH_FORCED_PROMPT)
-
-            # Go into the vtysh shell again. Exiting vtysh after calling "set
-            # prompt" successfully disables the vtysh shell prompt to its
-            # standard value, so it is necessary to call it again.
-            determine_set_prompt()
-
+        if determine_set_prompt(spawn):
             # From now on the shell _prompt attribute is set to the defined
             # vtysh forced prompt.
             self._prompt = join_prompt(VTYSH_FORCED_PROMPT)
@@ -194,27 +293,31 @@ class OpenSwitchVtyshShell(DockerShell):
             # WARNING: Using a private attribute here.
             self._try_filter_echo = True
 
+            spawn.sendline('exit')
+            spawn.expect(BASH_FORCED_PROMPT)
+
+            # If an older OpenSwitch image is being used here, is necessary to
+            # open the vtysh shell with echo enabled. Since a previous usage of
+            # the bash shell would have disabled the echo, it is enabled here.
+            spawn.sendline('stty sane')
+            spawn.expect(BASH_FORCED_PROMPT)
+
+            determine_set_prompt(spawn)
+
             # From now on the shell _prompt attribute is set to the defined
             # vtysh standard prompt.
             self._prompt = join_prompt(VTYSH_STANDARD_PROMPT)
-
-        # This sendline is used here just because a _setup_shell must end in an
-        # send/sendline call since it is followed by a call to expect in the
-        # connect method.
-        spawn.sendline('')
 
     def send_command(
         self, command, matches=None, newline=True, timeout=None,
         connection=None, silent=False
     ):
-        # This parent method performs the connection to the shell and the set
-        # up of a bash prompt to an unique value.
         match_index = super(OpenSwitchVtyshShell, self).send_command(
             command, matches=matches, newline=newline, timeout=timeout,
-            connection=connection, silent=silent
+            silent=silent
         )
 
-        spawn = self._get_connection(connection)
+        spawn = self._parent_connection._spawn
 
         # To find out if a segmentation fault error was produced, a search for
         # the "Segmentation fault" string in the output of the command is done.

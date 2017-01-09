@@ -32,9 +32,14 @@ from sys import stdout
 from os.path import join, dirname, normpath, abspath
 
 from topology_docker.node import DockerNode
-from topology_docker.shell import DockerBashShell
+from topology_docker_openswitch.connection import OpenswitchSSHConnection
+from topology_docker_openswitch.shell import (
+    OpenSwitchVtyshShell,
+    OpenSwitchBashShell,
+    OpenSwitchBashSwnsShell,
+    OpenSwitchVsctlShell
+)
 
-from .shell import OpenSwitchVtyshShell
 
 # When a failure happens during boot time, logs and other information is
 # collected to help with the debugging. The path of this collection is to be
@@ -115,42 +120,61 @@ class OpenSwitchNode(DockerNode):
             **kwargs
         )
 
+        self._register_connection_type('ssh', OpenswitchSSHConnection)
+
         # FIXME: Remove this attribute to merge with version > 1.6.0
         self.shared_dir_mount = '/tmp'
 
-        # Add vtysh (default) shell
-        # This shell is started as a bash shell but it changes itself to a
-        # vtysh one afterwards. This is necessary because this shell must be
-        # started from a bash one that has echo disabled to avoid wrong
-        # matching with some command output and by setting an unique prompt
-        # with the set prompt vtysh command
-        self._register_shell('vtysh', OpenSwitchVtyshShell(self.container_id))
+    @property
+    def default_connection(self):
+        return super(OpenSwitchNode, self.__class__).default_connection
 
-        # Add bash shells
+    @default_connection.setter
+    def default_connection(self, connection):
+        """
+        See :meth:`ConnectionAPI.default_connection` for more information.
 
-        initial_prompt = '(^|\n).*[#$] '
-        self._register_shell(
-            'bash',
-            DockerBashShell(
-                self.container_id, 'bash',
-                initial_prompt=initial_prompt
-            )
+        penswitch nodes support only one "console" connection,
+        this is done to keep behavior consistent with physical hardware
+        so this makes sure that only the '0' connection is used always.
+        """
+
+        if connection != '0':
+            raise Exception('Only one telnet connection is available.')
+
+        super(OpenSwitchNode, self.__class__).default_connection.fset(
+            self, connection
         )
-        self._register_shell(
-            'bash_swns',
-            DockerBashShell(
-                self.container_id, 'ip netns exec swns bash',
-                initial_prompt=initial_prompt
-            )
+
+    def connect(self, connection=None, connection_type=None,
+                via_node=None, **kwargs):
+        """
+        See :meth:`ConnectionAPI.connect` for more information.
+
+        Openswitch nodes support only one "console" connection,
+        this is done to keep behavior consistent with physical hardware
+        so this makes sure that only the '0' connection is used always.
+        """
+
+        connection_type = connection_type or self._default_connection_type
+
+        if connection_type is "docker":
+            if connection is not None and connection != '0':
+                raise Exception('Only one "console" connection is available.')
+
+        super(OpenSwitchNode, self).connect(
+            connection=connection, connection_type=connection_type,
+            via_node=via_node, **kwargs
         )
-        self._register_shell(
-            'vsctl',
-            DockerBashShell(
-                self.container_id, 'bash',
-                initial_prompt=initial_prompt,
-                prefix='ovs-vsctl ', timeout=60
-            )
-        )
+
+    def _register_shells(self, connectionobj):
+        """
+        See :meth:`CommonNode._register_shells` for more information.
+        """
+        connectionobj._register_shell('vtysh', OpenSwitchVtyshShell())
+        connectionobj._register_shell('bash', OpenSwitchBashShell())
+        connectionobj._register_shell('bash_swns', OpenSwitchBashSwnsShell())
+        connectionobj._register_shell('vsctl', OpenSwitchVsctlShell())
 
     def notify_post_build(self):
         """
@@ -294,15 +318,14 @@ class OpenSwitchNode(DockerNode):
 
     def stop(self):
         """
-        Exit all vtysh shells.
+        See :meth:`topology_docker.node.DockerNode.stop` for more information.
 
-        See :meth:`DockerNode.stop` for more information.
+        This method exits and stops the container.
         """
 
-        for shell in self._shells.values():
-            if isinstance(shell, OpenSwitchVtyshShell):
-                shell._exit()
-
+        for connection in self.available_connections():
+            conn = self.get_connection(connection=connection)
+            conn.get_shell('bash')._exit()
         super(OpenSwitchNode, self).stop()
 
 

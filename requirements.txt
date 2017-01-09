@@ -1,2 +1,3 @@
 six
-topology_docker
+-e git+git@github.com:matthew-m-hall/topology.git@master#egg=topology
+-e git+git@github.com:matthew-m-hall/topology_docker.git@master#egg=topology_docker
