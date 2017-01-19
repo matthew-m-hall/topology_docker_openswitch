@@ -32,7 +32,10 @@ from sys import stdout
 from os.path import join, dirname, normpath, abspath
 
 from topology_docker.node import DockerNode
-from topology_docker_openswitch.connection import OpenswitchSSHConnection
+from topology_docker_openswitch.connection import (
+    OpenswitchDockerConnection,
+    OpenswitchSSHConnection
+)
 from topology_docker_openswitch.shell import (
     OpenSwitchVtyshShell,
     OpenSwitchBashShell,
@@ -120,10 +123,16 @@ class OpenSwitchNode(DockerNode):
             **kwargs
         )
 
-        self._register_connection_type('ssh', OpenswitchSSHConnection)
-
         # FIXME: Remove this attribute to merge with version > 1.6.0
         self.shared_dir_mount = '/tmp'
+
+    def _docker_register_connection_types(self):
+        """
+        See :meth:`DockerNode._docker_register_connection_types`
+        for more information.
+        """
+        self._register_connection_type('docker', OpenswitchDockerConnection)
+        self._register_connection_type('ssh', OpenswitchSSHConnection)
 
     @property
     def default_connection(self):
@@ -325,7 +334,7 @@ class OpenSwitchNode(DockerNode):
 
         for connection in self.available_connections():
             conn = self.get_connection(connection=connection)
-            conn.get_shell('bash')._exit()
+            conn.disconnect()
         super(OpenSwitchNode, self).stop()
 
 
